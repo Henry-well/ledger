@@ -1,0 +1,88 @@
+name: Build Android APK
+
+# 触发方式：① 网页上手动点 "Run workflow"  ② 推送 v1.0.0 这样的标签
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+# 代码都在仓库的 ledger/ 子目录里，所有命令都在那里执行
+defaults:
+  run:
+    working-directory: ledger
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # 缓存 Android SDK / NDK / p4a，第二次构建能省 20~40 分钟。
+      # 首次没有缓存，会完整下载（约 2GB），慢是正常的。
+      - name: Cache buildozer (~/.buildozer)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            ~/.cache/pip
+          key: buildozer-${{ runner.os }}-${{ hashFiles('ledger/buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip openjdk-17-jdk-headless \
+            autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses-dev libtinfo6 \
+            cmake libffi-dev libssl-dev libltdl-dev
+
+      # Kivy 没有内置中文字形，必须把字体塞进 APK，否则界面全是方块
+      - name: Download Chinese font (Noto Sans CJK SC)
+        run: |
+          mkdir -p assets/fonts
+          FONT="assets/fonts/NotoSansCJKsc-Regular.otf"
+          curl -L --fail --retry 3 --retry-delay 5 -o "$FONT" \
+            "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf" \
+          || curl -L --fail --retry 3 --retry-delay 5 -o "$FONT" \
+            "https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf"
+          test -s "$FONT" || { echo "字体下载失败"; exit 1; }
+          ls -lh assets/fonts/
+
+      - name: Install buildozer
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          # cython 3.x 是新版 python-for-android 的要求，别用 0.29
+          python -m pip install "cython==3.0.11" "buildozer==1.5.0"
+
+      - name: Build APK (debug)
+        run: |
+          set -o pipefail
+          # buildozer 偶发在下载依赖时网络抖动，自动重试一次
+          { buildozer -v android debug || (sleep 20 && buildozer -v android debug); } 2>&1 | tee build.log
+
+      - name: Show build log tail on failure
+        if: failure()
+        run: tail -n 120 build.log || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledger-apk
+          path: ledger/bin/*.apk
+          if-no-files-found: error
+          retention-days: 30
